@@ -1,0 +1,198 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Project Proposal · Real-Time SPH Fluid Simulation</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <p class="back-link"><a href="index.html">← Project home</a></p>
+  <header>
+    <h1>Real-Time SPH Fluid Simulation in CUDA</h1>
+    <p>15-418/618 Final Project Proposal</p>
+    <p>Sami Sharif (ssharif) &amp; Nathan Mehaffy (nheaffy)</p>
+  </header>
+
+  <nav aria-label="Proposal sections">
+    <ul>
+      <li><a href="#summary">Summary</a></li>
+      <li><a href="#background">Background</a></li>
+      <li><a href="#challenge">The Challenge</a></li>
+      <li><a href="#resources">Resources</a></li>
+      <li><a href="#goals">Goals and Deliverables</a></li>
+      <li><a href="#platform">Platform Choice</a></li>
+      <li><a href="#schedule">Schedule</a></li>
+      <li><a href="#references">References</a></li>
+    </ul>
+  </nav>
+
+  <main>
+    <section aria-labelledby="url">
+      <h2 id="url">URL</h2>
+      <!-- Replace this placeholder with the published project URL. -->
+      <p><a href="https://USERNAME.github.io/REPO-NAME/">https://USERNAME.github.io/REPO-NAME/</a></p>
+    </section>
+
+    <section aria-labelledby="summary">
+      <h2 id="summary">Summary</h2>
+      <p>We are going to implement a 3D fluid simulator based on Smoothed Particle Hydrodynamics (SPH) entirely in CUDA on the NVIDIA RTX 2080 GPUs in the GHC machines. Our goal is to scale the simulation to as many particles as possible, and to measure and explain the bottlenecks in neighbor search, memory access, and rendering along the way. If time allows, we will use OpenGL to render a continuous surface with raymarching.</p>
+    </section>
+
+    <section aria-labelledby="background">
+      <h2 id="background">Background</h2>
+      <h3>SPH</h3>
+      <p>SPH (smoothed particle hydrodynamics) is a way of simulating fluids using discrete particles, each with a position and velocity. A fluid needs to maintain a constant density everywhere. The density of a given particle is defined by summing over its neighbors within radius <var>h</var>, weighted by a kernel <var>W</var>:</p>
+      <div class="equation">
+        <div>ρ<sub>i</sub> = ∑<sub>j</sub> m<sub>j</sub> W(‖<b>x</b><sub>i</sub> − <b>x</b><sub>j</sub>‖, h)</div>
+      </div>
+      <p>There are two ways to enforce constant density. The first is explicit (weakly compressible) SPH: each particle is pushed against the gradient of the density field, from dense regions toward sparse ones, by a pressure force. The pressure that a particle feels is defined by</p>
+      <div class="equation">
+        <div>P<sub>i</sub> = k(ρ<sub>i</sub> − ρ<sub>0</sub>)</div>
+      </div>
+      <p>where ρ<sub>0</sub> is the target density.</p>
+      <p>Explicit SPH is cheap per step, but the fluid visibly compresses unless the stiffness <var>k</var> is large, and a large <var>k</var> requires a very small timestep to stay stable, so it needs many substeps per frame.</p>
+      <p>The other way, which we will implement, is position based fluids (PBF) <a href="#macklin2013">[1]</a>. PBF is stable at much larger timesteps, so it needs fewer substeps per frame, but each substep costs more because it iterates. Constant density is treated as a constraint on each particle:</p>
+      <div class="equation">
+        <div>C<sub>i</sub> = ρ<sub>i</sub> / ρ<sub>0</sub> − 1 = 0</div>
+      </div>
+      <p>Each timestep, PBF solves for position corrections that bring every C<sub>i</sub> towards zero. A correction to one particle changes its neighbors' densities, so the constraints are coupled. So, PBF iterates until convergence. Each iteration first computes a scaling factor λ<sub>i</sub> for each particle from its density error, then moves each particle by an amount that depends on its own and its neighbors' λ values:</p>
+      <div class="equation">
+        <div>λ<sub>i</sub> = −C<sub>i</sub> / (∑<sub>k</sub> ‖∇<sub>k</sub>C<sub>i</sub>‖² + ε)</div>
+        <div>Δ<b>x</b><sub>i</sub> = (1/ρ<sub>0</sub>) ∑<sub>j</sub> (λ<sub>i</sub> + λ<sub>j</sub>) ∇W(<b>x</b><sub>i</sub> − <b>x</b><sub>j</sub>, h)</div>
+      </div>
+      <p>where ∇<sub>k</sub>C<sub>i</sub> is how much C<sub>i</sub> changes when particle <var>k</var> moves, and ε is a small constant that prevents division by zero.</p>
+
+      <h3>The algorithm:</h3>
+      <p>From a high level, the algorithm consists of the following steps for a given substep. For each frame, usually 3 substeps are run (more substeps is more stable but will reduce frame rate). We will have to experiment with implementation, but this is our initial idea: </p>
+      <ol>
+        <li>For each particle, apply gravity (v += gΔt) and predict its position, x* = x + vΔt.</li>
+        <li>Build the grid data for the particles from their predicted positions (i.e. get the grid location of each x*).</li>
+        <li>Create a histogram of particle counts in each grid cell location, do a scan, and insert each particle into the correct spot using the scan, essentially doing a parallel sort.</li>
+        <li>For each particle, do a neighborhood search only within the 27 surrounding cells of this particle's cell. Compute the density using this. The neighbors found here are kept fixed for the rest of the substep, even though particles move during the PBF iterations.</li>
+        <li>If using the first method for calculating pressure, simply plug in the numbers to get pressure and then move each particle to finish the algorithm. If using PBF, repeat:
+          <ol>
+            <li>For each particle, compute ρ<sub>i</sub> and λ<sub>i</sub>.</li>
+            <li>For each particle, compute Δx<sub>i</sub>.</li>
+            <li>For each particle, set x* += Δx.</li>
+            <li>Check convergence. If the max density error is small enough, stop iterating; otherwise, go back to step 5.1.</li>
+          </ol>
+        </li>
+        <li>For each particle, compute its velocity v = (x* − x)/Δt, apply viscosity, and set x = x*.</li>
+      </ol>
+
+      <p>The order that particles apply their corrections within an iteration matters:</p>
+      <ul>
+        <li>Jacobi: Every particle computes its corrections from values at the start of the iteration, and all particles update together. Every particle is independent within an iteration, so all particles can update in parallel. Convergence can be slower since a correction travels only one neighbor-distance per iteration.</li>
+        <li>Gauss-Seidel: Particles update one at a time, using the latest values of their neighbors, including ones updated in this iteration. It is harder to parallelize because of this dependency.</li>
+      </ul>
+
+      <h3>Parallelism</h3>
+      <p>The parallelism lies in every "for each particle" statement. Additionally, the neighborhood search will benefit the most from parallelism as we can quickly make a neighborhood per particle and only search within each particle's neighborhood. Gauss-Seidel will also massively be improved with parallelism since it typically has many dependencies while waiting for neighboring particles to finish computing.</p>
+
+      <h3>Rendering</h3>
+      To render for visual debugging we will use CUDA-OpenGL interop. We may expand the renderer to render a fluid volume if time permits.
+    </section>
+
+    <section aria-labelledby="challenge">
+      <h2 id="challenge">The Challenge</h2>
+      <p>The first challenge lies in concerns with neighborhood size. 27 cells cover 27<var>h</var>³, but the search sphere is 4.2<var>h</var>³. Smaller cells can be used, like cells of size <var>h</var>/2 means 125 cells covering 15.6<var>h</var>³, which is fewer neighbors to check but more cell lookups.</p>
+      <p>We must also consider how often to update the grid. For a correct algorithm, we need to rebuild the neighborhood table on every substep, but particles don't move much in a single substep, so this can waste work. We will experiment with:</p>
+          <ul>
+            <li>(a) Full rebuild every substep.</li>
+            <li>(b) Sort indices every substep but physically reorder only every <var>k</var> substeps, since locality degrades slowly.</li>
+            <li>(c) Pad the cells to <var>h</var> + 2<var>d</var> and rebuild only every <var>k</var> substeps, where <var>d</var> is the maximum displacement between rebuilds. This is correct as long as no particle moves more than <var>d</var>. The same padding argument covers the PBF iterations within a substep, where particles move but the neighbors found at the start of the substep are kept fixed.</li>
+          </ul>
+      <p>Because neighbors stay fixed across a substep's iterations, we can also choose between re-traversing the 27 cells in every iteration, which repeats the wasted candidate checks each time, and building an explicit neighbor list per particle once per substep (about 256 bytes per particle), which every iteration then reuses. Which is faster depends on how many iterations reuse the lists.</p>
+      <p>Divergence will also be a concern. Interior particles have many neighbors while particles at the surface or in a splash have few. Some alternatives may be putting particles in shared memory and parallelizing over cells rather than particles.</p>
+      <p>For non-PBF SPH, the main dependency is in the step where we calculate pressures. We first need to know every particle's density before we calculate its pressure. Furthermore, viscosity will read neighbor velocities while updating its own, so it needs separate input and output buffers to avoid a race.</p>
+      <p>Jacobi gives full parallelism but needs more iterations. Gauss-Seidel converges in fewer iterations but has less parallelism per pass. We will have to measure time to reach a target density error.</p>
+      <p>When implementing Gauss-Seidel iteration, we will have to use graph coloring so that direct neighbors never affect each other. We plan on using 8 colors between cells which is sufficient for separating neighbors in a 3D grid. However, within a cell, we will still do a sequential Gauss-Seidel loop. We will have to place barriers between color updates finishing. Lastly, we may have to do a global convergence check using some global reduction.</p>
+      <p>In terms of locality, particles near each other in space are not necessarily near each other in memory unless data is reordered. So, we may experiment with changing the ordering of particles in memory.</p>
+      <p>In terms of communication vs computation, for each candidate neighbor, we do very few computation, meaning our program will likely become memory-bound.</p>
+      <p>Gauss-Seidel may need many kernel launches (one per color), so launch overhead could hurt performance. For checking convergence, the CPU may have to decide, which will cause some slowdown on performance.</p>
+    </section>
+
+    <section aria-labelledby="resources">
+      <h2 id="resources">Resources</h2>
+      <ul>
+        <li><strong>Machines.</strong> The GHC cluster machines with NVIDIA GeForce RTX 2080 GPUs (compute capability 7.5, 8 GB memory, 2944 CUDA cores), which we will use for all development and measurement.</li>
+        <li><strong>Code base.</strong> We are writing the simulation and renderer from scratch in CUDA C++. Sebastian Lague's publicly available Unity project (C#/HLSL) <a href="#lague-sim">[2]</a> serves as a reference for expected visual behavior and simulation parameters, but we will not port the code directly since our implementation will differ.</li>
+        <li><strong>Libraries.</strong> Likely just CUDA-OpenGL for base visuals, and OpenMP for the CPU baseline.</li>
+        <li><strong>Tools.</strong> NVIDIA Nsight Systems and Nsight Compute for timeline and per-kernel profiling (achieved bandwidth, cache hit rates, warp efficiency).</li>
+        <li><strong>References.</strong> Macklin and Müller's position based fluids <a href="#macklin2013">[1]</a>, Müller et al.'s explicit SPH <a href="#muller2003">[3]</a>, Green's CUDA particle simulation write-up for the sort-based uniform grid <a href="#green2010">[4]</a>, the SPH state-of-the-art report by Ihmsen et al. <a href="#ihmsen2014">[5]</a>, Jones and Plassmann's parallel graph coloring <a href="#jones1993">[6]</a>, and (for our stretch goal) unified spray, foam, and bubble simulation by Ihmsen et al. <a href="#ihmsen2012">[7]</a>.</li>
+      </ul>
+    </section>
+
+    <section aria-labelledby="goals">
+      <h2 id="goals">Goals and Deliverables</h2>
+      <h3>Plan to achieve</h3>
+      <ol>
+        <li>An explicit (weakly compressible) SPH simulation in CUDA that behaves stably and plausibly in scenarios such as a dam break and a sloshing tank.</li>
+        <li>A sort-based uniform-grid neighbor search: a counting sort built from an atomic histogram, an exclusive scan, and a scatter, with particle data physically reordered by cell. We will compare reordering every substep against reordering every <var>k</var> substeps.</li>
+        <li>PBF with a parallel Jacobi solver.</li>
+        <li>PBF with a parallel Gauss-Seidel solver using 8-color cell coloring.</li>
+        <li>A multithreaded OpenMP CPU implementation of explicit SPH as a baseline.</li>
+        <li>Performance target: at least 60 fps (since that would make this real-time) at 500k particles for both explicit SPH and PBF, and at least a 10× speedup over the OpenMP CPU implementation on the same machine.</li>
+        <li>A thorough analysis: time to reach a target density error (e.g., max error below 1%) for Jacobi versus Gauss-Seidel; simulated seconds per wall-clock second for explicit SPH versus PBF; per-stage time breakdowns across particle counts; and achieved versus peak memory bandwidth for the main kernels.</li>
+      </ol>
+      <h3>Hope to achieve (likely not all, only 1-3)</h3>
+      <ul>
+        <li>1M particles at interactive frame rates (at least 30 fps).</li>
+        <li>Per-particle parallel graph coloring (e.g., Jones–Plassmann <a href="#jones1993">[6]</a>), recomputed every substep, compared against cell coloring.</li>
+        <li>Keeping the iteration loop and convergence check entirely on the GPU (a persistent kernel with cooperative-groups grid synchronization) to avoid a CPU round trip per iteration.</li>
+        <li>Alternative grid strategies: padded cells rebuilt every <var>k</var> substeps, explicit neighbor lists versus re-traversing the grid, and cells of size <var>h</var>/2.</li>
+        <li>Foam, spray, and bubble particles <a href="#ihmsen2012">[7]</a>. Each fluid particle may spawn a variable number of short-lived secondary particles per frame, which requires dynamic allocation on the GPU via atomic append buffers or scan-based stream compaction; we would compare both.</li>
+        <li>Rendering a continuous fluid surface in OpenGL.</li>
+      </ul>
+      <h3>If work goes more slowly</h3>
+      <p>We will cut scope in this order. First, drop the Gauss-Seidel solver and compare explicit SPH against Jacobi PBF. If PBF itself is delayed, focus on explicit SPH and the grid experiments (reordering frequency and neighbor lists). In either case, our committed particle count would drop to 250k.</p>
+      <h3>Poster session demo</h3>
+      <p>We plan to show a demo of a pre-recorded scene: a tank of water that moves around, showing how the water responds accordingly. Since this will run on the GHC machines, we will have to pre-render multiple scenes and composite them at the same frame rate the gates machine was running at.</p>
+      <h3>Questions our analysis will answer</h3>
+      <ul>
+        <li>Where does frame time go (sorting, each neighbor pass, convergence checks), and how does the breakdown change with particle count?</li>
+        <li>Does Gauss-Seidel's faster convergence outweigh its reduced parallelism, extra barriers, and worse locality compared with Jacobi, measured as time to reach a target density error?</li>
+        <li>Is PBF faster than explicit SPH per simulated second at the same level of compression?</li>
+        <li>How close do our kernels get to the GPU's memory bandwidth limit, and what prevents them from getting closer?</li>
+        <li>How much does physically reordering particle data improve achieved bandwidth and cache hit rates compared with index indirection?</li>
+        <li>How much do divergence and load imbalance from uneven neighbor counts cost, and do alternative work assignments (e.g., per-cell instead of per-particle) reduce it?</li>
+      </ul>
+    </section>
+
+    <section aria-labelledby="platform">
+      <h2 id="platform">Platform Choice</h2>
+      <p>SPH is a natural fit for a GPU. Every stage performs the same computation independently for each of hundreds of thousands of particles, which maps directly onto CUDA threads, and the workload is memory-bandwidth bound, so it benefits from the GPU's much higher memory bandwidth compared to the CPU. We chose CUDA rather than a higher-level framework because the optimizations we want to study require explicit control over thread-block organization, shared memory, atomics, and warp-level primitives, and because Nsight lets us measure the effect of each decision precisely. Doing the rendering on the same GPU with CUDA–OpenGL interop means simulated particle data never leaves the GPU, avoiding a per-frame transfer that would limit frame rate. Finally, the GHC machines' CPUs provide a fair multicore baseline on identical hardware.</p>
+    </section>
+
+    <section aria-labelledby="schedule">
+      <h2 id="schedule">Schedule</h2>
+      <div class="table-wrapper" role="region" aria-label="Project schedule" tabindex="0">
+        <table>
+          <thead><tr><th scope="col">Week</th><th scope="col">Dates</th><th scope="col">Tasks</th></tr></thead>
+          <tbody>
+            <tr><th scope="row">1</th><td>Nov 9–13</td><td>Set up CUDA boilerplate, a point-sprite debug view through CUDA–OpenGL interop, and some frame-to-video pipeline. Implement a naive explicit SPH simulation on the GPU that loops over all particles. Validate behavior on a dam-break scene.</td></tr>
+            <tr><th scope="row">2</th><td>Nov 16–20</td><td>Implement the sort-based uniform-grid neighbor search and physical reordering. Write the OpenMP CPU baseline. Collect first speedup measurements. Write the milestone report (due Mon Nov 23).</td></tr>
+            <tr><th scope="row">3</th><td>Nov 23–27</td><td>Implement PBF with the Jacobi solver and validate its stability at larger timesteps. Implement both convergence strategies. Compare explicit SPH against Jacobi PBF.</td></tr>
+            <tr><th scope="row">4</th><td>Nov 30–Dec 4</td><td>Implement the 8-color Gauss-Seidel solver and measure time to reach the target density error against Jacobi. Run the reordering-frequency experiment. Profile the main kernels with Nsight Compute. Start stretch goals if ahead of schedule.</td></tr>
+            <tr><th scope="row">5</th><td>Dec 7–11</td><td>Final measurements and graphs. Record the demo videos. Write and submit the final report (due Thu Dec 10).</tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <section aria-labelledby="references">
+      <h2 id="references">References</h2>
+      <ol>
+        <li id="macklin2013">M. Macklin and M. Müller. Position based fluids. <cite>ACM Transactions on Graphics (Proc. SIGGRAPH)</cite>, 32(4), 2013.</li>
+        <li id="lague-sim">S. Lague. <a href="https://www.youtube.com/watch?v=rSKMYc1CQHE">Coding Adventure: Simulating Fluids</a>. YouTube video, 2023. Source code: <a href="https://github.com/SebLague/Fluid-Sim">github.com/SebLague/Fluid-Sim</a>.</li>
+        <li id="muller2003">M. Müller, D. Charypar, and M. Gross. Particle-based fluid simulation for interactive applications. In <cite>Proc. ACM SIGGRAPH/Eurographics Symposium on Computer Animation</cite>, 2003.</li>
+        <li id="green2010">S. Green. Particle simulation using CUDA. NVIDIA whitepaper, 2010.</li>
+        <li id="ihmsen2014">M. Ihmsen, J. Orthmann, B. Solenthaler, A. Kolb, and M. Teschner. SPH fluids in computer graphics. In <cite>Eurographics State of the Art Reports</cite>, 2014.</li>
+        <li id="jones1993">M. T. Jones and P. E. Plassmann. A parallel graph coloring heuristic. <cite>SIAM Journal on Scientific Computing</cite>, 14(3), 1993.</li>
+        <li id="ihmsen2012">M. Ihmsen, N. Akinci, G. Akinci, and M. Teschner. Unified spray, foam and air bubbles for particle-based fluids. <cite>The Visual Computer</cite>, 28(6–8), 2012.</li>
+      </ol>
+    </section>
+  </main>
+</body>
+</html>

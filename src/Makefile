@@ -2,7 +2,7 @@ EXECUTABLE := render
 LDFLAGS=-L/usr/local/cuda-11.7/lib64/ -lcudart
 CU_FILES   := cudaRenderer.cu
 CU_DEPS    :=
-CC_FILES   := main.cpp refRenderer.cpp 
+CC_FILES   := main.cpp refRenderer.cpp stream.cpp
 LOGS	   := logs
 
 all: $(EXECUTABLE)
@@ -19,14 +19,14 @@ LIBS       :=
 FRAMEWORKS :=
 
 NVCCFLAGS=-O3 -m64 --gpu-architecture compute_61 -ccbin /usr/bin/g++-11
-LIBS += GL glut cudart
+LIBS += GL glut cudart EGL
 
 LDLIBS  := $(addprefix -l, $(LIBS))
 LDFRAMEWORKS := $(addprefix -framework , $(FRAMEWORKS))
 
 NVCC=nvcc
 
-OBJS=$(OBJDIR)/main.o $(OBJDIR)/refRenderer.o $(OBJDIR)/cudaRenderer.o
+OBJS=$(OBJDIR)/main.o $(OBJDIR)/refRenderer.o $(OBJDIR)/cudaRenderer.o $(OBJDIR)/stream.o
 
 
 

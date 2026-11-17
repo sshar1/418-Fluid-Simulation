@@ -1,22 +1,34 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string>
+#include <vector>
+#include <math_constants.h>
 
 #include "platformgl.h"          // must come before cuda_gl_interop.h
 #include <cuda_runtime.h>
 #include <cuda_gl_interop.h>
 
 #include "cudaRenderer.h"
+#include "simParams.h"
+#include "colormap.h"
+#include "helper_math.h"
 
-#define SIM_DT      1e-3f
-#define GRAVITY    -9.8f
-#define RADIUS      0.05f
-#define RESTITUTION 0.9f
+// Wrap CUDA API calls: print the error and exit instead of silently continuing.
+#define cudaCheck(call) \
+    do { \
+        cudaError_t err_ = (call); \
+        if (err_ != cudaSuccess) { \
+            fprintf(stderr, "CUDA error at %s:%d: %s\n", __FILE__, __LINE__, \
+                    cudaGetErrorString(err_)); \
+            exit(1); \
+        } \
+    } while (0)
 
 ////////////////////////////////////////////////////////////////////////////////////////
 
-CudaRenderer::CudaRenderer(int numParticles)
-    : numParticles(numParticles), positions(nullptr), velocities(nullptr), vboResource(nullptr) {}
+CudaRenderer::CudaRenderer(int numParticles, unsigned int seed)
+    : SPH_sim(seed), numParticles(numParticles),
+      positions(nullptr), velocities(nullptr), vboResource(nullptr) {}
 
 CudaRenderer::~CudaRenderer() {
     if (vboResource) cudaGraphicsUnregisterResource(vboResource);
@@ -28,7 +40,7 @@ void CudaRenderer::setup(unsigned int vbo) {
     int deviceCount = 0;
     bool isFastGPU = false;
     std::string name;
-    cudaError_t err = cudaGetDeviceCount(&deviceCount);
+    cudaCheck(cudaGetDeviceCount(&deviceCount));
 
     printf("---------------------------------------------------------\n");
     printf("Initializing CUDA for CudaRenderer\n");
@@ -57,57 +69,191 @@ void CudaRenderer::setup(unsigned int vbo) {
         printf("---------------------------------------------------------\n");
     }
 
-    float4* pos = new float4[numParticles];
-    float4* vel = new float4[numParticles];
-    for (int i = 0; i < numParticles; i++) {
-        pos[i] = make_float4(0.f, 0.5f, 0.f, 1.f);
-        vel[i] = make_float4(0.2f, 0.0f, 0.f, 0.f);
-    }
+    // Initial state is built on the host by SPH_sim (same code and RNG as the
+    // ref sim), then copied to the GPU.
+    std::vector<float4> pos(numParticles), vel(numParticles);
+    spawnParticles(numParticles, (float*)pos.data(), (float*)vel.data());
 
-    cudaMalloc(&positions, numParticles * sizeof(float4));
-    cudaMalloc(&velocities, numParticles * sizeof(float4));
-    cudaMemcpy(positions, pos, numParticles * sizeof(float4), cudaMemcpyHostToDevice);
-    cudaMemcpy(velocities, vel, numParticles * sizeof(float4), cudaMemcpyHostToDevice);
+    cudaCheck(cudaMalloc(&positions, numParticles * sizeof(float4)));
+    cudaCheck(cudaMalloc(&velocities, numParticles * sizeof(float4)));
+    cudaCheck(cudaMalloc(&densities, numParticles * sizeof(float)));
+    cudaCheck(cudaMemcpy(positions, pos.data(), numParticles * sizeof(float4), cudaMemcpyHostToDevice));
+    cudaCheck(cudaMemcpy(velocities, vel.data(), numParticles * sizeof(float4), cudaMemcpyHostToDevice));
+    cudaCheck(cudaMemset(densities, 0, numParticles * sizeof(float)));
 
-    delete[] pos;
-    delete[] vel;
-
-    cudaGraphicsGLRegisterBuffer(&vboResource, vbo, cudaGraphicsMapFlagsWriteDiscard);
+    cudaCheck(cudaGraphicsGLRegisterBuffer(&vboResource, vbo, cudaGraphicsMapFlagsWriteDiscard));
 }
 
-__global__ void kernelStep(float4* pos, float4* vel, float4* vboOut, int n, float dt) {
+__device__ float densityToPressure(float density) {
+    return kPressureMult * (density - kTargetDensity);
+}
+
+__device__ float smoothingKernel(float radius, float dst2) {
+    // float volume = CUDART_PI_F * std::pow(radius, 8) / 4; // TODO make a constant
+    // float value = max(0.f, radius * radius - dst2);
+    // return value * value * value / volume;
+
+    float dst = sqrt(dst2);
+    if (dst >= radius) return 0;
+    // float volume = CUDART_PI_F * std::pow(radius, 4) / 6;
+    // return (radius - dst) * (radius - dst) / volume;
+    return (radius - dst) * (radius - dst) * kSpikyNorm;
+}
+
+__device__ float smoothingKernelDerivative(float radius, float dst) {
+    // if (dst >= radius) return 0;
+
+    // float volume = CUDART_PI_F * std::pow(radius, 8) / 4; // TODO make a constant
+    // float f = radius * radius - dst * dst;
+    // return -6 * dst * f * f / volume;
+
+    if (dst >= radius) return 0;
+    // float scale = 12 / (std::pow(radius, 4) * CUDART_PI_F);
+    // return (dst - radius) * scale;
+    return (dst - radius) * kSpikyDerivNorm;
+}
+
+__device__ float calculateDensity(const float4* positions, float4 pos, int n) {
+    float density = 0.f;
+    for (int particle = 0; particle < n; particle++) {
+        float4 d = positions[particle] - pos;
+        density += smoothingKernel(kSmoothingRadius, dot(d, d));
+    }
+
+    return density;
+}
+
+// A = summation {A_j / p_j * ∇W} = summation {∇W}
+__device__ float3 calculateDensityGradient(const float4* positions, float4 pos, float* densities, int n) {
+    float4 grad = make_float4(0.f, 0.f, 0.f, 0.f);
+    for (int particle = 0; particle < n; particle++) {
+        float4 d = positions[particle] - pos;
+
+        float dst_squared = dot(d, d);
+        if (dst_squared <= __FLT_EPSILON__) continue;
+
+        float dst = sqrt(dst_squared);
+        float4 dir = d / dst;
+
+        grad += -dir * smoothingKernelDerivative(kSmoothingRadius, dst);
+    }
+
+    float3 res = make_float3(grad.x, grad.y, grad.z);
+    return res; 
+}
+
+__device__ float calculateSharedPressure(float density1, float density2) {
+    float pressure1 = densityToPressure(density1);
+    float pressure2 = densityToPressure(density2);
+    return (pressure1 + pressure2) / 2;
+}
+
+// A = summation {A_j / p_j * ∇W} = summation {∇W}
+__device__ float4 calculatePressureForce(const float4* positions, float4 pos, float* densities, int particle, int n) {
+    float4 pressure = make_float4(0.f, 0.f, 0.f, 0.f);
+    float myDensity = densities[particle];
+    for (int i = 0; i< n; i++) {
+        float4 d = positions[i] - pos;
+
+        float dst_squared = dot(d, d);
+        if (dst_squared <= __FLT_EPSILON__) continue;
+
+        float dst = sqrt(dst_squared);
+        float4 dir = d / dst;
+
+        float densityNeighbor = densities[i];
+        float sharedPressure = calculateSharedPressure(myDensity, densityNeighbor);
+
+        pressure += sharedPressure * dir * smoothingKernelDerivative(kSmoothingRadius, dst) / densityNeighbor;
+    }
+
+    // float3 res = make_float3(pressure.x, pressure.y, pressure.z);
+    // return res; 
+    return pressure;
+}
+
+__global__ void kernelDensities(const float4* pos, float* densities, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+
+    densities[i] = calculateDensity(pos, pos[i], n);
+}
+
+__global__ void kernelPressures(float4* pos, float4* vel, float* densities, int n, float dt) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+
+    float4 p = pos[i];
+
+    // Apply pressure forces
+    float4 pressureForce = calculatePressureForce(pos, p, densities, i, n);
+    float4 pressureAccel = pressureForce / densities[i];
+    vel[i] += pressureAccel * dt;
+}
+
+__global__ void kernelStep(float4* pos, float4* vel, float* densities, int n, float dt) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
 
     float4 p = pos[i];
     float4 v = vel[i];
 
-    v.y += GRAVITY * dt;
+    v.y += kGravity * dt;
     p.x += v.x * dt;
     p.y += v.y * dt;
 
-    // bounce off the window edges
-    if (p.y < -1.f + RADIUS && v.y < 0.f) { p.y = -1.f + RADIUS; v.y = -v.y * RESTITUTION; }
-    if (p.x < -1.f + RADIUS && v.x < 0.f) { p.x = -1.f + RADIUS; v.x = -v.x; }
-    if (p.x >  1.f - RADIUS && v.x > 0.f) { p.x =  1.f - RADIUS; v.x = -v.x; }
+    // bounce off the box walls: clamp inside and reflect with damping
+    const float hx = kBoundsW / 2 - kParticleRadius, hy = kBoundsH / 2 - kParticleRadius;
+    if (fabsf(p.x) > hx) { p.x = copysignf(hx, p.x); v.x *= -kCollisionDamping; }
+    if (fabsf(p.y) > hy) { p.y = copysignf(hy, p.y); v.y *= -kCollisionDamping; }
 
     pos[i] = p;
     vel[i] = v;
-    vboOut[i] = make_float4(p.x, p.y, p.z, 1.f);
 }
 
-void CudaRenderer::step() {
-    float4* vboPtr;
-    size_t bytes;
-    cudaGraphicsMapResources(1, &vboResource);
-    cudaGraphicsResourceGetMappedPointer((void**)&vboPtr, &bytes, vboResource);
-
+void CudaRenderer::step(float dt) {
     int threads = 256;
     int blocks  = (numParticles + threads - 1) / threads;
-    kernelStep<<<blocks, threads>>>((float4*)positions, (float4*)velocities, vboPtr, numParticles, SIM_DT);
-    cudaGetLastError();
+    kernelDensities<<<blocks, threads>>>((float4*)positions, densities, numParticles);
+    kernelPressures<<<blocks, threads>>>((float4*)positions, (float4*)velocities, densities, numParticles, dt);
+    kernelStep<<<blocks, threads>>>((float4*)positions, (float4*)velocities, densities, numParticles, dt);
+    cudaCheck(cudaGetLastError());
 
-    // Unmapping guarantees the kernel finishes before GL reads the buffer,
-    // so no cudaDeviceSynchronize() is needed.
-    cudaGraphicsUnmapResources(1, &vboResource);
+    // static int k = 0;
+    // if (k++ % 240 == 0) {
+    //     float d0;
+    //     cudaCheck(cudaMemcpy(&d0, densities + sizeof(float), sizeof(float), cudaMemcpyDeviceToHost));
+    //     printf("density: %.4f\n", d0);
+    // }
+}
+
+// Copy positions into the VBO and color each particle by speed. Once per frame.
+__global__ void kernelWriteVBO(const float4* pos, const float4* vel,
+                               float4* vboPos, uchar4* vboColor, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+
+    vboPos[i] = pos[i];
+    float4 v = vel[i];
+    RGBA8 c = speedToColor(v.x, v.y);
+    vboColor[i] = make_uchar4(c.r, c.g, c.b, c.a);
+}
+
+void CudaRenderer::writeToVBO() {
+    char* vboPtr;
+    size_t bytes;
+    cudaCheck(cudaGraphicsMapResources(1, &vboResource));
+    cudaCheck(cudaGraphicsResourceGetMappedPointer((void**)&vboPtr, &bytes, vboResource));
+
+    // Layout in SPH_sim.h: positions, then colors. The kernel writes the whole
+    // buffer, which the WriteDiscard map flag set in setup() requires.
+    int threads = 256;
+    int blocks  = (numParticles + threads - 1) / threads;
+    kernelWriteVBO<<<blocks, threads>>>((float4*)positions, (float4*)velocities, (float4*)vboPtr,
+                                        (uchar4*)(vboPtr + vboColorOffset(numParticles)), numParticles);
+    cudaCheck(cudaGetLastError());
+
+    // Unmapping guarantees the kernel (and every one before it) finishes
+    // before GL reads the buffer, so no cudaDeviceSynchronize() is needed.
+    cudaCheck(cudaGraphicsUnmapResources(1, &vboResource));
 }

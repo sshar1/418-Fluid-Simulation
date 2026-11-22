@@ -6,6 +6,7 @@
 #include "refRenderer.h"
 #include "cudaRenderer.h"
 #include "stream.h"
+#include "benchmark.h"
 #include "simParams.h"
 #include "fixedStepper.h"
 
@@ -61,6 +62,9 @@ static SPH_sim* makeSim(bool useCuda) {
 }
 
 int main(int argc, char** argv) {
+    if (argc > 3 && strcmp(argv[1], "--bench") == 0)
+        return runBenchmark(atoi(argv[2]), atoi(argv[3]));
+
     bool useCuda = (argc > 1 && strcmp(argv[1], "cuda") == 0);
 
     if (argc > 2 && strcmp(argv[2], "--stream") == 0)   // headless, see stream.cpp

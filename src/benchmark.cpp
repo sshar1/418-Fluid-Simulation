@@ -1,200 +1,63 @@
-// #include <string>
-// #include <math.h>
+#include <math.h>
+#include <stdio.h>
+#include <algorithm>
+#include <chrono>
+#include <vector>
 
-// #include "circleRenderer.h"
-// #include "cycleTimer.h"
-// #include "image.h"
-// #include "ppm.h"
+#include "platformgl.h"
+#include "benchmark.h"
+#include "refRenderer.h"
+#include "cudaRenderer.h"
+#include "stream.h"
 
+static void readPositions(SPH_sim& sim, GLuint vbo, std::vector<float>& pos) {
+    sim.writeToVBO();
+    glBindBuffer(GL_ARRAY_BUFFER, vbo);
+    glGetBufferSubData(GL_ARRAY_BUFFER, 0, pos.size() * sizeof(float), pos.data());
+    glBindBuffer(GL_ARRAY_BUFFER, 0);
+}
 
-// static void compare_images(const Image* ref_image, const Image* cuda_image) {
-//     int i;
+static double timeSim(SPH_sim& sim, int steps, std::vector<float>& pos) {
+    GLuint vbo;
+    glGenBuffers(1, &vbo);
+    glBindBuffer(GL_ARRAY_BUFFER, vbo);
+    glBufferData(GL_ARRAY_BUFFER, vboBytes(sim.getNumParticles()), nullptr, GL_DYNAMIC_DRAW);
+    glBindBuffer(GL_ARRAY_BUFFER, 0);
+    sim.setup(vbo);
 
-//     int mismatch_count = 0;
-    
-//     if (ref_image->width != cuda_image->width || ref_image->height != cuda_image->height) {
-//         printf ("Error : width or height of reference and cuda not matching\n");
-//         printf ("Cuda : width = %d, height = %d\n", cuda_image->width, cuda_image->height);
-//         printf ("Ref : width = %d, height = %d\n", ref_image->width, ref_image->height);
-//         exit (1);
-//     }
-    
-//     for (i = 0 ; i < 4 * ref_image->width * ref_image->height; i++) {
-//         // Compare with floating point error tolerance of 0.1f and ignore alpha
-//         if (fabs(ref_image->data[i] - cuda_image->data[i]) > 0.1f && i%4 != 3) {
-//             mismatch_count++;
-//             // Get pixel number and print values
-//             int j = i/4;
-//             printf ("Mismatch detected at pixel [%d][%d], value = %f, expected %f ", 
-//                     j/cuda_image->width, j%cuda_image->width, 
-//                     cuda_image->data[i], ref_image->data[i]);
+    sim.step(kDt);
+    readPositions(sim, vbo, pos);
 
-//             printf ("for color ");
-//             switch (i%4) {
-//                 case 0 : printf ("Red\n"); break;
-//                 case 1 : printf ("Green\n"); break;
-//                 case 2 : printf ("Blue\n"); break;
-//             }
+    auto start = std::chrono::steady_clock::now();
+    for (int s = 0; s < steps; s++) sim.step(kDt);
+    readPositions(sim, vbo, pos);
+    std::chrono::duration<double, std::milli> elapsed = std::chrono::steady_clock::now() - start;
+    return elapsed.count() / steps;
+}
 
+int runBenchmark(int n, int steps) {
+    if (n <= 0 || steps <= 0) {
+        fprintf(stderr, "usage: ./render --bench N STEPS\n");
+        return 1;
+    }
+    if (!makeOffscreenContext()) {
+        fprintf(stderr, "bench: could not create an EGL OpenGL context\n");
+        return 1;
+    }
 
-//         }
+    RefRenderer ref(n, kSeed);
+    CudaRenderer cuda(n, kSeed);
+    std::vector<float> refPos(4 * n), cudaPos(4 * n);
+    double refMs  = timeSim(ref, steps, refPos);
+    double cudaMs = timeSim(cuda, steps, cudaPos);
 
-//         // Ignore 5 errors - may come up because of rounding in distance calculation
-//         if (mismatch_count > 5) {
-//             printf ("ERROR : Mismatch detected between reference and actual\n");
-//             exit (1);
-//         }
+    float maxDiff = 0.f;
+    for (int i = 0; i < 4 * n; i++) maxDiff = std::max(maxDiff, fabsf(refPos[i] - cudaPos[i]));
 
-//     }
-
-//     printf ("***************** Correctness check passed **************************\n");
-// }
-
-// void
-// startBenchmark(
-//     CircleRenderer* renderer,
-//     int startFrame,
-//     int totalFrames,
-//     const std::string& frameFilename)
-// {
-
-//     double totalClearTime = 0.f;
-//     double totalAdvanceTime = 0.f;
-//     double totalRenderTime = 0.f;
-//     double totalFileSaveTime = 0.f;
-//     double totalTime = 0.f;
-//     double startTime= 0.f;
-
-//     bool dumpFrames = frameFilename.length() > 0;
-
-//     printf("\nRunning benchmark, %d frames, beginning at frame %d ...\n", totalFrames, startFrame);
-//     if (dumpFrames)
-//         printf("Dumping frames to %s_xxx.ppm\n", frameFilename.c_str());
-
-//     for (int frame=0; frame<startFrame + totalFrames; frame++) {
-
-//         if (frame == startFrame)
-//             startTime = CycleTimer::currentSeconds();
-
-//         double startClearTime = CycleTimer::currentSeconds();
-
-//         renderer->clearImage();
-
-//         double endClearTime = CycleTimer::currentSeconds();
-
-//         renderer->advanceAnimation();
-
-//         double endAdvanceTime = CycleTimer::currentSeconds();
-
-//         renderer->render();
-
-//         double endRenderTime = CycleTimer::currentSeconds();
-
-//         if (frame >= startFrame) {
-//             if (dumpFrames) {
-//                 char filename[1024];
-//                 sprintf(filename, "%s_%04d.ppm", frameFilename.c_str(), frame);
-//                 writePPMImage(renderer->getImage(), filename);
-//                 //renderer->dumpParticles("snow.par");
-//             }
-
-//             double endFileSaveTime = CycleTimer::currentSeconds();
-
-//             totalClearTime += endClearTime - startClearTime;
-//             totalAdvanceTime += endAdvanceTime - endClearTime;
-//             totalRenderTime += endRenderTime - endAdvanceTime;
-//             totalFileSaveTime += endFileSaveTime - endRenderTime;
-//         }
-//     }
-
-//     double endTime = CycleTimer::currentSeconds();
-//     totalTime = endTime - startTime;
-
-//     printf("Clear:    %.4f ms\n", 1000.f * totalClearTime / totalFrames);
-//     printf("Advance:  %.4f ms\n", 1000.f * totalAdvanceTime / totalFrames);
-//     printf("Render:   %.4f ms\n", 1000.f * totalRenderTime / totalFrames);
-//     printf("Total:    %.4f ms\n", 1000.f * (totalClearTime + totalAdvanceTime + totalRenderTime) / totalFrames);
-//     if (dumpFrames)
-//         printf("File IO:  %.4f ms\n", 1000.f * totalFileSaveTime / totalFrames);
-//     printf("\n");
-//     printf("Overall:  %.4f sec (note units are seconds)\n", totalTime);
-
-// }
-
-
-// void
-// CheckBenchmark(
-//     CircleRenderer* ref_renderer,
-//     CircleRenderer* cuda_renderer,
-//     int startFrame,
-//     int totalFrames,
-//     const std::string& frameFilename)
-// {
-
-//     double totalClearTime = 0.f;
-//     double totalAdvanceTime = 0.f;
-//     double totalRenderTime = 0.f;
-//     double totalFileSaveTime = 0.f;
-//     double totalTime = 0.f;
-//     double startTime= 0.f;
-
-//     bool dumpFrames = frameFilename.length() > 0;
-
-//     printf("\nRunning benchmark, %d frames, beginning at frame %d ...\n", totalFrames, startFrame);
-//     if (dumpFrames)
-//         printf("Dumping frames to %s_xxx.ppm\n", frameFilename.c_str());
-
-//     for (int frame=0; frame<startFrame + totalFrames; frame++) {
-
-//         if (frame == startFrame)
-//             startTime = CycleTimer::currentSeconds();
-
-//         ref_renderer->clearImage();
-//         double startClearTime = CycleTimer::currentSeconds();
-//         cuda_renderer->clearImage();
-//         double endClearTime = CycleTimer::currentSeconds();
-
-//         ref_renderer->advanceAnimation();
-//         double startAdvanceTime = CycleTimer::currentSeconds();
-//         cuda_renderer->advanceAnimation();
-//         double endAdvanceTime = CycleTimer::currentSeconds(); 
-
-//         ref_renderer->render();
-//         double startRenderTime = CycleTimer::currentSeconds();
-//         cuda_renderer->render();
-//         double endRenderTime = CycleTimer::currentSeconds();
-
-//         if (frame >= startFrame) {
-//             double startFileSaveTime = CycleTimer::currentSeconds();
-//             if (dumpFrames) {
-//                 char filename[1024];
-//                 sprintf(filename, "%s_%04d.ppm", frameFilename.c_str(), frame);
-//                 writePPMImage(cuda_renderer->getImage(), filename);
-//                 //renderer->dumpParticles("snow.par");
-//             }
-
-//             double endFileSaveTime = CycleTimer::currentSeconds();
-
-//             totalClearTime += endClearTime - startClearTime;
-//             totalAdvanceTime += endAdvanceTime - startAdvanceTime;
-//             totalRenderTime += endRenderTime - startRenderTime;
-//             totalFileSaveTime += endFileSaveTime - startFileSaveTime;
-//         }
-//     }
-
-
-//     compare_images(ref_renderer->getImage(), cuda_renderer->getImage());
-
-//     double endTime = CycleTimer::currentSeconds();
-//     totalTime = endTime - startTime; 
-
-//     printf("Clear:    %.4f ms\n", 1000.f * totalClearTime / totalFrames);
-//     printf("Advance:  %.4f ms\n", 1000.f * totalAdvanceTime / totalFrames);
-//     printf("Render:   %.4f ms\n", 1000.f * totalRenderTime / totalFrames);
-//     printf("Total:    %.4f ms\n", 1000.f * (totalClearTime + totalAdvanceTime + totalRenderTime) / totalFrames);
-//     if (dumpFrames)
-//         printf("File IO:  %.4f ms\n", 1000.f * totalFileSaveTime / totalFrames);
-//     printf("\n");
-//     printf("Overall:  %.4f sec (note units are seconds)\n", totalTime);
-
-// }
+    printf("%d particles, %d steps\n", n, steps);
+    printf("ref:     %.4f ms/step\n", refMs);
+    printf("cuda:    %.4f ms/step\n", cudaMs);
+    printf("speedup: %.1fx\n", refMs / cudaMs);
+    printf("max position diff: %g\n", maxDiff);
+    return 0;
+}

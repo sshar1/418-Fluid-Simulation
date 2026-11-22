@@ -30,7 +30,7 @@
 static const double kMaxFps = 60.0;       // like vsync; also keeps ssh bandwidth sane
 static const unsigned int kMagic = 0x33485053;   // "SPH3"
 
-static bool makeOffscreenContext() {
+bool makeOffscreenContext() {
     unsetenv("DISPLAY");   // with ssh -X, EGL would otherwise try the forwarded display
     EGLDisplay dpy = eglGetDisplay(EGL_DEFAULT_DISPLAY);
     if (dpy == EGL_NO_DISPLAY || !eglInitialize(dpy, nullptr, nullptr)) return false;

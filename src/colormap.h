@@ -1,13 +1,8 @@
 #pragma once
 
 #include <math.h>
+#include "hostDevice.h"
 #include "simParams.h"
-
-#ifdef __CUDACC__
-#define HOST_DEVICE __host__ __device__
-#else
-#define HOST_DEVICE
-#endif
 
 struct RGBA8 { unsigned char r, g, b, a; };
 

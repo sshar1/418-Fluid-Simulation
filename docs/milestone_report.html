@@ -1,0 +1,115 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Milestone Report · Real-Time SPH Fluid Simulation</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <p class="back-link"><a href="index.html">← Project home</a></p>
+  <header>
+    <h1>SPH Fluid Simulation in CUDA</h1>
+    <p>15-418/618 Final Project Milestone Report</p>
+    <p>Sami Sharif (ssharif) &amp; Nathan Mehaffy (nheaffy)</p>
+  </header>
+
+  <nav aria-label="Milestone report sections">
+    <ul>
+      <li><a href="#schedule">Revised Schedule</a></li>
+      <li><a href="#completed">Work Completed</a></li>
+      <li><a href="#goals">Progress Toward Goals</a></li>
+      <li><a href="#poster">Poster Session Plan</a></li>
+      <li><a href="#results">Preliminary Results</a></li>
+      <li><a href="#concerns">Concerns</a></li>
+    </ul>
+  </nav>
+
+  <main>
+    <section aria-labelledby="schedule">
+      <h2 id="schedule">Revised Schedule</h2>
+      <h3>Completed</h3>
+      <div class="table-wrapper" role="region" aria-label="Completed work" tabindex="0">
+        <table>
+          <thead><tr><th scope="col">Dates</th><th scope="col">Task</th><th scope="col">Who</th><th scope="col">Status</th></tr></thead>
+          <tbody>
+            <tr><td>Nov 9-13</td><td>CUDA boilerplate, CUDA-OpenGL point-sprite view</td><td>Sami</td><td>Done</td></tr>
+            <tr><td>Nov 9-17</td><td>Naive O(n²) explicit SPH on the GPU</td><td>Sami</td><td>Done</td></tr>
+            <tr><td>Nov 16-22</td><td>Serial CPU baseline and benchmarking harness</td><td>Nathan</td><td>Done, unmerged (PR #1)</td></tr>
+            <tr><td>Nov 16-23</td><td>Sort-based uniform grid with physical reordering, CPU and GPU</td><td>Nathan</td><td>Done, unmerged (PR #2)</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h3>Remaining</h3>
+      <div class="table-wrapper" role="region" aria-label="Remaining work" tabindex="0">
+        <table>
+          <thead><tr><th scope="col">Dates</th><th scope="col">Task</th><th scope="col">Who</th></tr></thead>
+          <tbody>
+            <tr><td rowspan="2">Nov 23-25</td></tr>
+            <tr><td>Dam-break scene and viscosity</td><td>Sami</td></tr>
+            <tr><td rowspan="2">Nov 26-29</td></tr>
+            <tr><td>Start PBF with the Jacobi solver</td><td>Sami</td></tr>
+            <tr><td rowspan="2">Nov 30-Dec 2</td><td>Finish Jacobi PBF and the convergence check; compare against explicit SPH</td><td>Sami</td></tr>
+            <tr><td>Reorder every substep vs. every <var>k</var> substeps</td><td>Nathan</td></tr>
+            <tr><td rowspan="2">Dec 3-6</td><td>Gauss-Seidel PBF with 8-color cell coloring</td><td>Sami</td></tr>
+            <tr><td>Nsight profiling of the main kernels</td><td>Nathan</td></tr>
+            <tr><td rowspan="2">Dec 7-10</td><td>Final measurements, graphs, demo videos</td><td>Nathan</td></tr>
+            <tr><td>Final report (due Thu Dec 10)</td><td>Sami, Nathan</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <section aria-labelledby="completed">
+      <h2 id="completed">Work Completed</h2>
+      <p>After the first week, our naive implementation was fully working and the boilerplate of openGL-CUDA was fully in place. All the basic math for density, pressure, and wall collisions were also finished. In the second week, we worked on a serial CPU baseline against which we could measure speedups. We also worked on the nearest-neighbor search using a uniform grid and thrust's exclusive scan, similar to the circle renderer from assignment 2. Lastly, the CPU baseline was also used to verify correctness of our CUDA implementation. We currently have the particle simulation running with 64k particles at around 2.47ms per step.</p>
+    </section>
+
+    <section aria-labelledby="goals">
+      <h2 id="goals">Progress Toward Goals</h2>
+      <div class="table-wrapper" role="region" aria-label="Goal status" tabindex="0">
+        <table>
+          <thead><tr><th scope="col">Proposal goal</th><th scope="col">Status</th></tr></thead>
+          <tbody>
+            <tr><td>Explicit SPH, dam break and sloshing tank</td><td>Working in 2D (proposal: 3D). No dam-break or sloshing scene yet. No viscosity.</td></tr>
+            <tr><td>Sort-based grid with physical reordering</td><td>Done. Reorders every step; the every-k comparison is not done.</td></tr>
+            <tr><td>PBF, Jacobi</td><td>Not started</td></tr>
+            <tr><td>PBF, Gauss-Seidel (with grid coloring)</td><td>Not started</td></tr>
+            <tr><td>CPU baseline</td><td>Serial baseline done (not openMP; may not do that)</td></tr>
+            <tr><td>Analysis</td><td>Benchmark harness exists; no data yet</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p>We are on-track to finish with our proposal, but we may not make the baseline OpenMP for the reason that it may not be necessary. We will likely not add the rendering to the fluid and instead keep everything as discrete particles, which is fine since that was a stretch. </p>
+
+    <section aria-labelledby="poster">
+      <h2 id="poster">Poster Session Plan</h2>
+      <p>For the poster session we plan on doing a live demo of our fluid simulation, comparing it to a serial version, and preparing a couple scenes.</p>
+    </section>
+
+    <section aria-labelledby="results">
+      <h2 id="results">Preliminary Results</h2>
+      <div class="table-wrapper" role="region" aria-label="Preliminary timings" tabindex="0">
+        <table>
+          <caption>Explicit SPH with the uniform grid, ms per step</caption>
+          <thead><tr><th scope="col">Particles</th><th scope="col">CPU serial</th><th scope="col">GPU</th><th scope="col">Speedup</th></tr></thead>
+          <tbody>
+            <tr><td>16k</td><td>38.9</td><td>0.67</td><td>58.05x</td></tr>
+            <tr><td>64k</td><td>157</td><td>1.77</td><td>88.7x</td></tr>
+            <tr><td>256k</td><td>644</td><td>6.57</td><td>98.02x</td></tr>
+            <tr><td>1M</td><td>2,469</td><td>22.2</td><td>111.22x</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <section aria-labelledby="concerns">
+      <h2 id="concerns">Concerns</h2>
+      <ul>
+        <li>2D vs. 3D: the simulation is 2D, but the proposal is 3D. We will have to move to 3D but the piping is already done to easily make the switch.
+      </ul>
+    </section>
+  </main>
+</body>
+</html>

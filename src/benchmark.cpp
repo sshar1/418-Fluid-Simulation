@@ -1,7 +1,6 @@
-#include <math.h>
 #include <stdio.h>
-#include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <vector>
 
 #include "platformgl.h"
@@ -35,9 +34,9 @@ static double timeSim(SPH_sim& sim, int steps, std::vector<float>& pos) {
     return elapsed.count() / steps;
 }
 
-int runBenchmark(int n, int steps) {
-    if (n <= 0 || steps <= 0) {
-        fprintf(stderr, "usage: ./render --bench N STEPS\n");
+int runBenchmark(int n, float boxScale, int steps) {
+    if (n <= 0 || boxScale <= 0 || steps <= 0) {
+        fprintf(stderr, "usage: ./render --bench N BOXSCALE STEPS\n");
         return 1;
     }
     if (!makeOffscreenContext()) {
@@ -45,19 +44,20 @@ int runBenchmark(int n, int steps) {
         return 1;
     }
 
-    RefRenderer ref(n, kSeed);
-    CudaRenderer cuda(n, kSeed);
+    RefRenderer ref(n, kSeed, boxScale);
+    CudaRenderer cuda(n, kSeed, boxScale);
     std::vector<float> refPos(4 * n), cudaPos(4 * n);
     double refMs  = timeSim(ref, steps, refPos);
     double cudaMs = timeSim(cuda, steps, cudaPos);
 
     float maxDiff = 0.f;
-    for (int i = 0; i < 4 * n; i++) maxDiff = std::max(maxDiff, fabsf(refPos[i] - cudaPos[i]));
+    for (int i = 0; i < 4 * n; i++) {
+        float diff = fabsf(refPos[i] - cudaPos[i]);
+        if (diff > maxDiff || std::isnan(diff)) maxDiff = diff;
+    }
 
-    printf("%d particles, %d steps\n", n, steps);
-    printf("ref:     %.4f ms/step\n", refMs);
-    printf("cuda:    %.4f ms/step\n", cudaMs);
-    printf("speedup: %.1fx\n", refMs / cudaMs);
-    printf("max position diff: %g\n", maxDiff);
+    float w = kBoundsW * boxScale, h = kBoundsH * boxScale;
+    printf("n=%d box=%gx%g density=%.1f steps=%d | ref %.3f ms, cuda %.3f ms, speedup %.1fx, max diff %g\n",
+           n, w, h, n / (w * h), steps, refMs, cudaMs, refMs / cudaMs, maxDiff);
     return 0;
 }

@@ -10,6 +10,7 @@
 
 #include "cudaRenderer.h"
 #include "simParams.h"
+#include "sphKernels.h"
 #include "colormap.h"
 #include "helper_math.h"
 
@@ -84,35 +85,6 @@ void CudaRenderer::setup(unsigned int vbo) {
     cudaCheck(cudaGraphicsGLRegisterBuffer(&vboResource, vbo, cudaGraphicsMapFlagsWriteDiscard));
 }
 
-__device__ float densityToPressure(float density) {
-    return kPressureMult * (density - kTargetDensity);
-}
-
-__device__ float smoothingKernel(float radius, float dst2) {
-    // float volume = CUDART_PI_F * std::pow(radius, 8) / 4; // TODO make a constant
-    // float value = max(0.f, radius * radius - dst2);
-    // return value * value * value / volume;
-
-    float dst = sqrt(dst2);
-    if (dst >= radius) return 0;
-    // float volume = CUDART_PI_F * std::pow(radius, 4) / 6;
-    // return (radius - dst) * (radius - dst) / volume;
-    return (radius - dst) * (radius - dst) * kSpikyNorm;
-}
-
-__device__ float smoothingKernelDerivative(float radius, float dst) {
-    // if (dst >= radius) return 0;
-
-    // float volume = CUDART_PI_F * std::pow(radius, 8) / 4; // TODO make a constant
-    // float f = radius * radius - dst * dst;
-    // return -6 * dst * f * f / volume;
-
-    if (dst >= radius) return 0;
-    // float scale = 12 / (std::pow(radius, 4) * CUDART_PI_F);
-    // return (dst - radius) * scale;
-    return (dst - radius) * kSpikyDerivNorm;
-}
-
 __device__ float calculateDensity(const float4* positions, float4 pos, int n) {
     float density = 0.f;
     for (int particle = 0; particle < n; particle++) {
@@ -140,12 +112,6 @@ __device__ float3 calculateDensityGradient(const float4* positions, float4 pos, 
 
     float3 res = make_float3(grad.x, grad.y, grad.z);
     return res; 
-}
-
-__device__ float calculateSharedPressure(float density1, float density2) {
-    float pressure1 = densityToPressure(density1);
-    float pressure2 = densityToPressure(density2);
-    return (pressure1 + pressure2) / 2;
 }
 
 // A = summation {A_j / p_j * ∇W} = summation {∇W}

@@ -1,4 +1,3 @@
-// TODO NATHAN: ref renderer with openmp
 #pragma once
 #include <vector>
 #include "SPH_sim.h"
@@ -8,6 +7,7 @@ private:
     int n;
     unsigned int vbo;
     std::vector<float> pos, vel;          // 4 floats per particle
+    std::vector<float> densities;
     std::vector<unsigned char> colors;    // 4 bytes (RGBA) per particle, filled in writeToVBO
 public:
     RefRenderer(int numParticles, unsigned int seed);

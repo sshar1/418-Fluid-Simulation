@@ -9,10 +9,16 @@ private:
     float* positions;       // n * float4
     float* velocities;      // n * float4
     float* densities;       // n * float
+    float* posTmp;
+    float* velTmp;
+    int* cellStart;
+    int* rank;
     cudaGraphicsResource* vboResource;
 
+    void buildGrid();
+
 public:
-    CudaRenderer(int numParticles, unsigned int seed);
+    CudaRenderer(int numParticles, unsigned int seed, float boxScale = 1.f);
     ~CudaRenderer();
 
     int  getNumParticles() const override { return numParticles; }

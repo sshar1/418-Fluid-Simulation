@@ -1,12 +1,15 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string>
+#include <utility>
 #include <vector>
 #include <math_constants.h>
 
 #include "platformgl.h"          // must come before cuda_gl_interop.h
 #include <cuda_runtime.h>
 #include <cuda_gl_interop.h>
+#include <thrust/execution_policy.h>
+#include <thrust/scan.h>
 
 #include "cudaRenderer.h"
 #include "simParams.h"
@@ -27,14 +30,20 @@
 
 ////////////////////////////////////////////////////////////////////////////////////////
 
-CudaRenderer::CudaRenderer(int numParticles, unsigned int seed)
-    : SPH_sim(seed), numParticles(numParticles),
-      positions(nullptr), velocities(nullptr), vboResource(nullptr) {}
+CudaRenderer::CudaRenderer(int numParticles, unsigned int seed, float boxScale)
+    : SPH_sim(seed, boxScale), numParticles(numParticles),
+      positions(nullptr), velocities(nullptr), densities(nullptr),
+      posTmp(nullptr), velTmp(nullptr), cellStart(nullptr), rank(nullptr), vboResource(nullptr) {}
 
 CudaRenderer::~CudaRenderer() {
     if (vboResource) cudaGraphicsUnregisterResource(vboResource);
     cudaFree(positions);
     cudaFree(velocities);
+    cudaFree(densities);
+    cudaFree(posTmp);
+    cudaFree(velTmp);
+    cudaFree(cellStart);
+    cudaFree(rank);
 }
 
 void CudaRenderer::setup(unsigned int vbo) {
@@ -78,6 +87,10 @@ void CudaRenderer::setup(unsigned int vbo) {
     cudaCheck(cudaMalloc(&positions, numParticles * sizeof(float4)));
     cudaCheck(cudaMalloc(&velocities, numParticles * sizeof(float4)));
     cudaCheck(cudaMalloc(&densities, numParticles * sizeof(float)));
+    cudaCheck(cudaMalloc(&posTmp, numParticles * sizeof(float4)));
+    cudaCheck(cudaMalloc(&velTmp, numParticles * sizeof(float4)));
+    cudaCheck(cudaMalloc(&cellStart, (grid.numCells() + 1) * sizeof(int)));
+    cudaCheck(cudaMalloc(&rank, numParticles * sizeof(int)));
     cudaCheck(cudaMemcpy(positions, pos.data(), numParticles * sizeof(float4), cudaMemcpyHostToDevice));
     cudaCheck(cudaMemcpy(velocities, vel.data(), numParticles * sizeof(float4), cudaMemcpyHostToDevice));
     cudaCheck(cudaMemset(densities, 0, numParticles * sizeof(float)));
@@ -85,12 +98,12 @@ void CudaRenderer::setup(unsigned int vbo) {
     cudaCheck(cudaGraphicsGLRegisterBuffer(&vboResource, vbo, cudaGraphicsMapFlagsWriteDiscard));
 }
 
-__device__ float calculateDensity(const float4* positions, float4 pos, int n) {
+__device__ float calculateDensity(const float4* positions, float4 pos, Grid grid, const int* cellStart) {
     float density = 0.f;
-    for (int particle = 0; particle < n; particle++) {
+    grid.forEachNeighbor(pos.x, pos.y, cellStart, [&](int particle) {
         float4 d = positions[particle] - pos;
         density += smoothingKernel(kSmoothingRadius, dot(d, d));
-    }
+    });
 
     return density;
 }
@@ -115,14 +128,14 @@ __device__ float3 calculateDensityGradient(const float4* positions, float4 pos, 
 }
 
 // A = summation {A_j / p_j * ∇W} = summation {∇W}
-__device__ float4 calculatePressureForce(const float4* positions, float4 pos, float* densities, int particle, int n) {
+__device__ float4 calculatePressureForce(const float4* positions, float4 pos, float* densities, int particle, Grid grid, const int* cellStart) {
     float4 pressure = make_float4(0.f, 0.f, 0.f, 0.f);
     float myDensity = densities[particle];
-    for (int i = 0; i< n; i++) {
+    grid.forEachNeighbor(pos.x, pos.y, cellStart, [&](int i) {
         float4 d = positions[i] - pos;
 
         float dst_squared = dot(d, d);
-        if (dst_squared <= __FLT_EPSILON__) continue;
+        if (dst_squared <= __FLT_EPSILON__) return;
 
         float dst = sqrt(dst_squared);
         float4 dir = d / dst;
@@ -131,33 +144,33 @@ __device__ float4 calculatePressureForce(const float4* positions, float4 pos, fl
         float sharedPressure = calculateSharedPressure(myDensity, densityNeighbor);
 
         pressure += sharedPressure * dir * smoothingKernelDerivative(kSmoothingRadius, dst) / densityNeighbor;
-    }
+    });
 
     // float3 res = make_float3(pressure.x, pressure.y, pressure.z);
     // return res; 
     return pressure;
 }
 
-__global__ void kernelDensities(const float4* pos, float* densities, int n) {
+__global__ void kernelDensities(const float4* pos, float* densities, Grid grid, const int* cellStart, int n) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
 
-    densities[i] = calculateDensity(pos, pos[i], n);
+    densities[i] = calculateDensity(pos, pos[i], grid, cellStart);
 }
 
-__global__ void kernelPressures(float4* pos, float4* vel, float* densities, int n, float dt) {
+__global__ void kernelPressures(float4* pos, float4* vel, float* densities, Grid grid, const int* cellStart, int n, float dt) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
 
     float4 p = pos[i];
 
     // Apply pressure forces
-    float4 pressureForce = calculatePressureForce(pos, p, densities, i, n);
+    float4 pressureForce = calculatePressureForce(pos, p, densities, i, grid, cellStart);
     float4 pressureAccel = pressureForce / densities[i];
     vel[i] += pressureAccel * dt;
 }
 
-__global__ void kernelStep(float4* pos, float4* vel, float* densities, int n, float dt) {
+__global__ void kernelStep(float4* pos, float4* vel, float* densities, Grid grid, int n, float dt) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
 
@@ -169,7 +182,7 @@ __global__ void kernelStep(float4* pos, float4* vel, float* densities, int n, fl
     p.y += v.y * dt;
 
     // bounce off the box walls: clamp inside and reflect with damping
-    const float hx = kBoundsW / 2 - kParticleRadius, hy = kBoundsH / 2 - kParticleRadius;
+    const float hx = grid.boundsW / 2 - kParticleRadius, hy = grid.boundsH / 2 - kParticleRadius;
     if (fabsf(p.x) > hx) { p.x = copysignf(hx, p.x); v.x *= -kCollisionDamping; }
     if (fabsf(p.y) > hy) { p.y = copysignf(hy, p.y); v.y *= -kCollisionDamping; }
 
@@ -177,12 +190,44 @@ __global__ void kernelStep(float4* pos, float4* vel, float* densities, int n, fl
     vel[i] = v;
 }
 
-void CudaRenderer::step(float dt) {
+__global__ void kernelCount(const float4* pos, int* cellStart, int* rank, Grid grid, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+
+    rank[i] = atomicAdd(&cellStart[grid.cellOf(pos[i].x, pos[i].y)], 1);
+}
+
+__global__ void kernelReorder(const float4* pos, const float4* vel, float4* posTmp, float4* velTmp,
+                              const int* cellStart, const int* rank, Grid grid, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+
+    int dst = cellStart[grid.cellOf(pos[i].x, pos[i].y)] + rank[i];
+    posTmp[dst] = pos[i];
+    velTmp[dst] = vel[i];
+}
+
+void CudaRenderer::buildGrid() {
     int threads = 256;
     int blocks  = (numParticles + threads - 1) / threads;
-    kernelDensities<<<blocks, threads>>>((float4*)positions, densities, numParticles);
-    kernelPressures<<<blocks, threads>>>((float4*)positions, (float4*)velocities, densities, numParticles, dt);
-    kernelStep<<<blocks, threads>>>((float4*)positions, (float4*)velocities, densities, numParticles, dt);
+    int cells   = grid.numCells() + 1;
+    cudaCheck(cudaMemset(cellStart, 0, cells * sizeof(int)));
+    kernelCount<<<blocks, threads>>>((float4*)positions, cellStart, rank, grid, numParticles);
+    thrust::exclusive_scan(thrust::device, cellStart, cellStart + cells, cellStart);
+    kernelReorder<<<blocks, threads>>>((float4*)positions, (float4*)velocities, (float4*)posTmp, (float4*)velTmp,
+                                       cellStart, rank, grid, numParticles);
+    std::swap(positions, posTmp);
+    std::swap(velocities, velTmp);
+}
+
+void CudaRenderer::step(float dt) {
+    buildGrid();
+
+    int threads = 256;
+    int blocks  = (numParticles + threads - 1) / threads;
+    kernelDensities<<<blocks, threads>>>((float4*)positions, densities, grid, cellStart, numParticles);
+    kernelPressures<<<blocks, threads>>>((float4*)positions, (float4*)velocities, densities, grid, cellStart, numParticles, dt);
+    kernelStep<<<blocks, threads>>>((float4*)positions, (float4*)velocities, densities, grid, numParticles, dt);
     cudaCheck(cudaGetLastError());
 
     // static int k = 0;
@@ -199,10 +244,11 @@ __global__ void kernelWriteVBO(const float4* pos, const float4* vel,
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
 
-    vboPos[i] = pos[i];
     float4 v = vel[i];
+    int id = (int)v.w;
+    vboPos[id] = pos[i];
     RGBA8 c = speedToColor(v.x, v.y);
-    vboColor[i] = make_uchar4(c.r, c.g, c.b, c.a);
+    vboColor[id] = make_uchar4(c.r, c.g, c.b, c.a);
 }
 
 void CudaRenderer::writeToVBO() {

@@ -8,9 +8,12 @@ private:
     unsigned int vbo;
     std::vector<float> pos, vel;          // 4 floats per particle
     std::vector<float> densities;
+    std::vector<float> posTmp, velTmp;
+    std::vector<int> cellStart, rank;
+    void buildGrid();
     std::vector<unsigned char> colors;    // 4 bytes (RGBA) per particle, filled in writeToVBO
 public:
-    RefRenderer(int numParticles, unsigned int seed);
+    RefRenderer(int numParticles, unsigned int seed, float boxScale = 1.f);
     ~RefRenderer() {}
     int  getNumParticles() const override { return n; }
     void setup(unsigned int vbo) override;

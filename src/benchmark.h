@@ -1,3 +1,3 @@
 #pragma once
 
-int runBenchmark(int n, int steps);
+int runBenchmark(int n, float boxScale, int steps);
